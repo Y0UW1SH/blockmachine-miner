@@ -3,6 +3,7 @@
 - [How it works](#how-it-works)
 - [Node Eligibility Requirements](#node-eligibility-requirements)
 - [Capacity Testing](#capacity-testing)
+- [Capacity helper](#capacity-helper-optional-archive-nodes)
 - [Base Incentive](#base-incentive)
 - [Getting started](#getting-started)
 - [Pricing](#pricing)
@@ -257,9 +258,11 @@ publish are the properties that make the test fair:
 - **The workload is genuinely heavy.** Full traces of large blocks, not point reads a hot cache
   serves in a millisecond. A connection cap or a request limit in front of your node turns
   refused requests into 20-second penalties; the only way to score is to serve the burst.
-- **The test hits the endpoint you registered.** There is no separate test endpoint to
-  special-case, and the burst arrives with your node drained of customer traffic, so it
-  measures your node and nothing else.
+- **The test hits the endpoint you registered**, and the burst arrives with your node drained
+  of customer traffic, so it measures your node and nothing else. You may also run the optional
+  [capacity helper](#capacity-helper-optional-archive-nodes) at `/capacity-test` on that same
+  endpoint; it changes how much of an answer crosses the internet, never which questions are
+  asked or how they are marked.
 
 ### Fairness commitments
 
@@ -268,6 +271,172 @@ publish are the properties that make the test fair:
 - Scores, reasons and measurement times are visible to you.
 - Methodology changes are published before they change anyone's routing. This section is that
   publication for the burst test.
+
+## Capacity helper (optional, archive nodes)
+
+The capacity test measures how fast your node computes answers. Some of those answers are
+megabytes long, and without help, the time they take to cross the internet to our tester is
+counted too, so a node far from the tester scores lower than the same node close to it.
+
+The **capacity helper** removes most of that. It is a small program that runs next to your node.
+During a capacity test it puts our questions to your node from inside your own server and sends
+back a short summary of each answer instead of the whole answer. A megabyte takes several trips
+across the internet to reach us and a short summary takes one, so what the helper removes is the
+extra cost of carrying large answers over distance.
+
+- **Optional.** Without it, your node is tested directly, the way every node with no
+  helper is.
+- **Archive nodes only, for now.** Full nodes are always tested directly.
+- **It can raise your score, and that moves where everyone stands.** A capacity score is
+  measured against the fastest node on your chain, so as nodes take up the helper the
+  standard rises and a node without one can score lower than it did, even though nothing
+  about it changed. We think that is the right trade: the time spent shipping a large
+  answer across the internet is not your node computing, and it should not have counted.
+  But it is a real effect and you should hear it from us.
+- **It does not change what we ask or how we mark it.** Customer traffic, eligibility, and
+  the questions stay the same, and your node is scored on the same answers it would have
+  given anyway.
+- **Light.** One program, using about 5 MB of memory when idle, and it does nothing at all
+  between tests.
+
+### Requirements
+
+- **Run it on the same machine as your node**, or at least on the same local network. If the
+  helper has to reach your node over the internet, you lose the benefit.
+- **It must be reachable at `/capacity-test` on the endpoint you registered**, with the same host and
+  port. If you registered `wss://203.0.113.10`, the helper must answer at
+  `wss://203.0.113.10/capacity-test`.
+- **It checks your node's Blockmachine secret** (`SECRET_V1` from your `.env`, the one you
+  registered) and refuses every connection without it.
+- **If your endpoint serves its own certificate**, which it does if you registered an IP
+  address rather than a domain, `capacity-helper check` needs that certificate's fingerprint
+  to connect. Run the check once without it and it prints the fingerprint, and the command to
+  run pinned to it. This affects the check only: we test your node against the certificate you
+  registered with us either way.
+- **It reads its secret once, when it starts.** So a secret rotation leaves it holding the
+  old one until you restart it. From `bm miner secret promote` onwards we present the new
+  secret, the helper refuses it, and your node is tested directly. Nothing is lost while that
+  is true — those runs are ordinary direct tests — but it does not fix itself, so the last
+  step of [Secret rotation](#secret-rotation-zero-downtime) is where you give the helper the
+  new secret and restart it.
+
+### Install it
+
+1. **Download it** from this repository's
+   [latest release](https://github.com/taostat/blockmachine-miner/releases/latest). It is one
+   file, for x86-64 and for arm64:
+
+   These run anywhere — your home directory is fine. They put the helper on your `PATH`
+   as `capacity-helper`:
+
+   ```bash
+   base=https://github.com/taostat/blockmachine-miner/releases/latest/download
+   asset="capacity-helper-linux-$(uname -m)"
+   curl -fsSLO "$base/$asset" -fsSLO "$base/SHA256SUMS"
+   sha256sum -c SHA256SUMS --ignore-missing
+   sudo install -m 0755 "$asset" /usr/local/bin/capacity-helper
+   ```
+
+   Check the checksum before you install it; `sha256sum -c` must say `OK`. Keep the
+   downloaded name until you have, because that is the name the checksums are written
+   against. Do not run these from a clone of this repository: there is a directory called
+   `capacity-helper` there, and installing onto that name would put the binary inside it.
+
+2. **Run it**, pointed at your node's WebSocket RPC port:
+
+   ```bash
+   CAPACITY_HELPER_SECRET='<your node secret>' capacity-helper \
+     --node ws://127.0.0.1:8546 \
+     --family evm \
+     --listen 127.0.0.1:9955
+   ```
+
+   - **`--node`:** your node's WebSocket RPC address as the helper sees it. On a tao node this
+     is typically `ws://127.0.0.1:9944`.
+   - **`--family`:** `evm` for every EVM chain, `substrate` for tao.
+   - **`--listen`:** where the helper answers. Which address is right depends on what
+     forwards `/capacity-test` to it:
+     - **Your own proxy, running directly on this machine:** use `127.0.0.1:9955`, so
+       nothing outside the machine can reach the helper at all.
+     - **The gateway stack in this repository:** the gateway is a container, and a
+       container's `127.0.0.1` is its own, not the host's — a helper on the host's
+       loopback is unreachable from it, and every capacity test gets a 502. Bind to the
+       address Docker gives the host instead:
+
+       ```bash
+       docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'
+       ```
+
+       That prints the address to use, almost always `172.17.0.1`, so the helper is
+       started with `--listen 172.17.0.1:9955`. `0.0.0.0:9955` also works, but then
+       block port 9955 at your firewall: the helper turns away anything without your
+       secret, but there is no reason to offer it to the internet.
+
+   To keep it running, there is a systemd unit at `capacity-helper/capacity-helper.service`
+   in this repository; its install steps are in the comment at the top of the file, and they
+   are meant to be run from the root of a clone of it.
+
+3. **Route `/capacity-test` to it.**
+
+   **If you run the gateway stack in this repository, the routing is already done** — it
+   sends `/capacity-test` to port 9955 on the host. The one thing you must get right is the
+   address the helper listens on, in the step above: the gateway cannot reach the host's
+   `127.0.0.1`. If you put the helper somewhere else entirely, set `CAPACITY_HELPER_HOST`
+   and `CAPACITY_HELPER_PORT` in `.env` and run `docker compose up -d gateway`.
+
+   The route is always present, whether or not you run a helper. With no helper behind it
+   a capacity test gets a 502 there and your node is tested directly, exactly as it is for
+   every node that runs no helper.
+
+   Otherwise, add the path to whatever terminates TLS on your registered endpoint. It is a
+   WebSocket connection, so pass the upgrade headers through, and pass `Authorization`
+   through unchanged.
+
+   nginx:
+   ```nginx
+   location = /capacity-test {
+       proxy_pass http://127.0.0.1:9955;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection "upgrade";
+       proxy_set_header Authorization $http_authorization;
+       proxy_read_timeout 600s;
+   }
+   ```
+
+   Caddy:
+   ```caddy
+   handle /capacity-test {
+       reverse_proxy 127.0.0.1:9955
+   }
+   ```
+
+   If nothing sits in front of your node and it serves TLS itself, you need a reverse proxy
+   for this path. Without the helper, your node is tested directly.
+
+4. **Check it**, from anywhere:
+
+   ```bash
+   capacity-helper check --endpoint wss://203.0.113.10 --secret '<your node secret>'
+   ```
+
+   Put your own registered endpoint there, without a path. This connects to `/capacity-test`
+   exactly as our tester will, puts one question to your node through the helper, and prints
+   either `ok` or what is wrong. If your endpoint serves its own certificate, it prints that
+   certificate's fingerprint and the command to run pinned to it.
+
+
+### What happens if the helper is down or misconfigured
+
+**If our tester cannot reach a working helper at `/capacity-test` when a test starts, it tests
+your node directly.** A helper that is stopped, crashed, not routed, or set to the wrong chain
+costs you nothing: we find out before the test begins and go straight to your node.
+
+**Once a test has started through your helper it is different.** From that point your node's
+questions go through it, and anything it does not deliver is charged to your node the same way
+it is when your node stops answering. That is true whether it stops part way through or never
+passes a single question on. So run it under something that keeps it up — the systemd unit in
+this repository restarts it — and use `capacity-helper check` after any change to your setup.
 
 ## Base incentive
 
@@ -541,6 +710,12 @@ bm --testnet miner add --endpoint wss://$IP --alias my-node --secret "$SECRET" -
 │  │          │─────▶│ host /proc       │      │
 │  └──────────┘      └──────────────────┘      │
 │                                              │
+│  ┌──────────┐      ┌──────────────────┐      │
+│  │ capacity │─────▶│ node RPC         │      │
+│  │ helper   │      │ (same machine)   │      │
+│  └──────────┘      └──────────────────┘      │
+│    ▲ /capacity-test (optional)               │
+│    │                                         │
 │  ┌──────────┐                                │
 │  │ certbot  │ (optional)                     │
 │  └──────────┘                                │
@@ -550,6 +725,10 @@ bm --testnet miner add --endpoint wss://$IP --alias my-node --secret "$SECRET" -
 - **nginx gateway** — Terminates TLS, authenticates requests via bearer token, proxies WebSocket and HTTP RPC to the chain node. Supports dual secrets for zero-downtime rotation. The eth gateway template routes by the `Upgrade` header so a single 443 endpoint serves both JSON-RPC and `eth_subscribe`.
 - **chain node** — yours: any accepted client for your chain, meeting the eligibility requirements for its declared type.
 - **metrics** — Exposes `/metrics` internally; nginx publishes it at `https://<endpoint>/metrics` with the same bearer auth as RPC.
+- **capacity helper** — Optional, archive nodes. Puts our capacity questions to your node from
+  inside your own server and returns a short summary of each answer, so the time a large answer
+  takes to cross the internet is not counted against you. nginx routes `/capacity-test` to it.
+  See [Capacity helper](#capacity-helper-optional-archive-nodes).
 - **certbot** — Optional. Auto-renews Let's Encrypt certificates. Only used with domain-based setups.
 
 ## Secret rotation (zero downtime)
@@ -579,6 +758,11 @@ Rotate your bearer token without dropping any traffic:
    # Edit .env: move SECRET_V2 value to SECRET_V1, clear SECRET_V2
    docker compose up -d gateway
    ```
+   **If you run the [capacity helper](#capacity-helper-optional-archive-nodes), give it the new
+   secret now too and restart it** — under systemd, that is the new value in
+   `/etc/blockmachine/capacity-helper.env` and `sudo systemctl restart capacity-helper`. It
+   reads its secret once when it starts, so until you do, it refuses our tests and your node is
+   tested directly. Nothing is lost while that is true, but it does not fix itself.
 
 ## Configuration
 
@@ -591,6 +775,8 @@ Environment variables in `.env`:
 | `DOMAIN` | (empty) | Domain for Let's Encrypt auto-renewal |
 | `CHAIN` | `tao` | Chain selection |
 | `METRICS_PORT` | `9100` | Internal metrics exporter port |
+| `CAPACITY_HELPER_HOST` | `host.docker.internal` | Where the gateway looks for the optional [capacity helper](#capacity-helper-optional-archive-nodes) |
+| `CAPACITY_HELPER_PORT` | `9955` | Port the capacity helper listens on |
 | `SSL_CERT_PATH` | `/etc/nginx/ssl/cert.pem` | TLS certificate path in container |
 | `SSL_KEY_PATH` | `/etc/nginx/ssl/key.pem` | TLS key path in container |
 | `BM_MINER_GIT_SHA` | `unknown` | Deployed repository commit exposed in metrics |
