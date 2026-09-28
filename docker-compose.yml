@@ -30,7 +30,10 @@ services:
       - metrics
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      # 127.0.0.1, NOT localhost: nginx listens on 0.0.0.0:80, and in this
+      # image localhost resolves to ::1 first, so the check was refused every
+      # time and the gateway was never marked healthy.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
